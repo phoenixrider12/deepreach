@@ -284,7 +284,7 @@ class Experiment(ABC):
 
                     num_CSL_val_samples = int(0.1*num_CSL_samples)
                     CSL_val_dataset = scenario_optimization(
-                        model=self.model, policy=self.model, dynamics=self.dataset.dynamics,
+                        device=device, model=self.model, policy=self.model, dynamics=self.dataset.dynamics,
                         tMin=self.dataset.tMin, tMax=CSL_tMax, dt=CSL_dt,
                         set_type="BRT", control_type="value", # TODO: implement option for BRS too
                         scenario_batch_size=min(num_CSL_val_samples, 100000), sample_batch_size=min(10*num_CSL_val_samples, 1000000),
@@ -297,7 +297,7 @@ class Experiment(ABC):
                     CSL_val_costs = CSL_val_dataset['costs']
 
                     CSL_val_tMax_dataset = scenario_optimization(
-                        model=self.model, policy=self.model, dynamics=self.dataset.dynamics,
+                        device=device, model=self.model, policy=self.model, dynamics=self.dataset.dynamics,
                         tMin=self.dataset.tMin, tMax=self.dataset.tMax, dt=CSL_dt,
                         set_type="BRT", control_type="value", # TODO: implement option for BRS too
                         scenario_batch_size=min(num_CSL_val_samples, 100000), sample_batch_size=min(10*num_CSL_val_samples, 1000000),
