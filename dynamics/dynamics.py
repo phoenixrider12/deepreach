@@ -1268,3 +1268,297 @@ class LessLinearND(Dynamics):
         }
 
    
+class Quadrotor10D(Dynamics):
+    def __init__(self):
+        # ===== drone 'carl' (SousVide configs/frames/carl.json) =====
+        # This model is IDENTICAL to SousVide's figs/dynamics/quadcopter_rate_model
+        # (quaternion kinematics + collective thrust along body-z + gravity), in the
+        # SAME world frame: z-DOWN (NED), gravity +g on z. The only bookkeeping
+        # differences vs SousVide are (a) state order [p,q,v] here vs [p,v,q] there,
+        # (b) quaternion scalar-first (qw,qx,qy,qz) here vs scalar-last there, and
+        # (c) the thrust input is the total force f (N) here vs uf in SousVide, with
+        #     f = 4*kt*uf. None of these change the physics; the SousVide<->DeepReach
+        #     state map is a pure reindex (no reflection):
+        #       sv [x,y,z,vx,vy,vz,qx,qy,qz,qw] <-> dr [x,y,z,qw,qx,qy,qz,vx,vy,vz]
+        self.m = 1.144                       # mass [kg]
+        self.kt = 6.90                       # motor thrust coeff
+        self.n_rotors = 4
+        self.arm_l = 0.17
+        self.Gz = 9.81                       # gravity, +z (z-DOWN / NED) -> matches SousVide
+        self.set_mode = 'avoid'
+
+        # Control limits from SousVide Viper bounds: uf in [-1,0], w in [-5,5].
+        # Thrust force f = 4*kt*uf  ->  f in [-27.6, 0] N (f=0: zero thrust; f<0: thrust "up").
+        self.f_min = -self.n_rotors * self.kt * 1.0     # -27.6 N (max thrust)
+        self.f_max = 0.0                                #   0.0 N (zero thrust)
+        self.w_max_xy = 5.0
+        self.w_max_z = 5.0
+
+        # Drone modeled as a sphere of this radius (arm_l + prop/margin) for collision.
+        self.collisionR = 0.20
+
+        # ===== mid_gate "gate" obstacle (SousVide world frame, z-DOWN, metres) =====
+        # Measured from the mid_gate GSplat. All in the same frame the drone flies in.
+        # Gate frame panel (solid box; the two holes are carved out of it):
+        self.frame_lo = [-1.034, -0.50, -1.85]   # [x,y,z] min  (z=-1.85 top, +0.02 bottom)
+        self.frame_hi = [-0.430,  0.65,  0.02]   # [x,y,z] max
+        # Two traversable openings (x widened so the holes fully pierce the panel):
+        self.hole_up_lo = [-1.30, -0.37, -1.82]; self.hole_up_hi = [-0.20, 0.50, -0.97]  # upper
+        self.hole_lo_lo = [-1.30, -0.37, -0.92]; self.hole_lo_hi = [-0.20, 0.50, -0.03]  # lower
+        # Two triangular stands (vertical prisms): (x,y) triangle vertices + z extent.
+        self.stand_z = [-1.85, 0.10]
+        self.standL_tri = [[-1.034, -0.50], [-0.430, -0.50], [-0.732, -1.40]]  # -y side
+        self.standR_tri = [[-1.034,  0.65], [-0.430,  0.65], [-0.732,  1.40]]  # +y side
+
+        # ===== state-space box enclosing the gate (BRT compute domain) =====
+        self.state_range_ = torch.tensor([
+            [-3.0, 2.0],     # x  (gate panel at x~-0.73)
+            [-2.5, 2.5],     # y  (stands reach +/-1.4)
+            [-2.5, 0.5],     # z  (z-DOWN: -2.5 above gate top, +0.5 below floor)
+            [-1.0, 1.0],     # qw
+            [-1.0, 1.0],     # qx
+            [-1.0, 1.0],     # qy
+            [-1.0, 1.0],     # qz
+            [-6.0, 6.0],     # vx
+            [-6.0, 6.0],     # vy
+            [-6.0, 6.0],     # vz
+            ]).cuda()
+        self.control_range_ = torch.tensor([[self.f_min, self.f_max],
+                [-self.w_max_xy, self.w_max_xy],
+                [-self.w_max_xy, self.w_max_xy],
+                [-self.w_max_z, self.w_max_z]]).cuda()
+        self.eps_var = torch.tensor([10.0, 4.0, 4.0, 4.0]).cuda()
+        self.control_init = torch.tensor([-self.m * self.Gz, 0.0, 0.0, 0.0]).cuda()  # hover thrust
+
+        state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
+        state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
+        if self.set_mode=='reach_avoid':
+            l_type='brat_hjivi'
+        else:
+            l_type='brt_hjivi'
+        super().__init__(
+            name='Quadrotor10D', loss_type=l_type, set_mode=self.set_mode,
+            state_dim=10, input_dim=11, control_dim=4, disturbance_dim=0,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),
+            value_mean=1.0,           # ~mid-range of boundary_fn over the domain (metres)
+            value_var=2.0,            # ~half-range of boundary_fn over the domain
+            value_normto=0.02,
+            deepReach_model='exact',
+        )
+    def normalize_q(self, x):
+        # normalize quaternion
+        normalized_x = x*1.0
+        q_tensor = x[..., 3:7]
+        q_tensor = torch.nn.functional.normalize(
+            q_tensor, p=2,dim=-1)  # normalize quaternion
+        normalized_x[..., 3:7] = q_tensor
+        return normalized_x
+    
+    def clamp_state_input(self, state_input):
+        return self.normalize_q(state_input)
+
+    def control_range(self, state):
+        return [[self.f_min, self.f_max],
+                [-self.w_max_xy, self.w_max_xy],
+                [-self.w_max_xy, self.w_max_xy],
+                [-self.w_max_z, self.w_max_z]]
+
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+    
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def periodic_transform_fn(self, input):
+        return input.cuda()
+    
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        # return wrapped_state
+        return self.normalize_q(wrapped_state)
+
+    def dsdt(self, state, control, disturbance):
+        qw = state[..., 3] * 1.0
+        qx = state[..., 4] * 1.0
+        qy = state[..., 5] * 1.0
+        qz = state[..., 6] * 1.0
+        vx = state[..., 7] * 1.0
+        vy = state[..., 8] * 1.0
+        vz = state[..., 9] * 1.0
+
+        f = (control[..., 0]) * 1.0
+        wx = (control[..., 1]) * 1.0
+        wy = (control[..., 2]) * 1.0
+        wz = (control[..., 3]) * 1.0
+
+        dsdt = torch.zeros_like(state)
+        dsdt[..., 0] = vx
+        dsdt[..., 1] = vy
+        dsdt[..., 2] = vz
+        dsdt[..., 3] = -(wx * qx + wy * qy + wz * qz) / 2.0
+        dsdt[..., 4] = (wx * qw + wz * qy - wy * qz) / 2.0
+        dsdt[..., 5] = (wy * qw - wz * qx + wx * qz) / 2.0
+        dsdt[..., 6] = (wz * qw + wy * qx - wx * qy) / 2.0
+        dsdt[..., 7] = 2 * (qw * qy + qx * qz) / self.m * f
+        dsdt[..., 8] = 2 * (-qw * qx + qy * qz) / self.m * f
+        dsdt[..., 9] = self.Gz + (1 - 2 * torch.pow(qx, 2) - 2 * torch.pow(qy, 2)) / self.m * f
+
+        return dsdt
+
+    # ---- signed-distance helpers (negative inside, positive outside) ----
+    @staticmethod
+    def _sdf_box(p, lo, hi):
+        """Signed distance to an axis-aligned box. p: (...,3); lo,hi: (3,) tensors."""
+        c = 0.5 * (lo + hi)
+        h = 0.5 * (hi - lo)
+        q = torch.abs(p - c) - h
+        outside = torch.norm(torch.clamp(q, min=0.0), dim=-1)
+        inside = torch.clamp(torch.amax(q, dim=-1), max=0.0)
+        return outside + inside
+
+    @staticmethod
+    def _sdf_tri2d(p2, v0, v1, v2):
+        """Exact signed distance to a 2D triangle (negative inside). p2: (...,2)."""
+        e0 = v1 - v0; e1 = v2 - v1; e2 = v0 - v2
+        w0 = p2 - v0; w1 = p2 - v1; w2 = p2 - v2
+        d2 = lambda a: (a * a).sum(-1)
+        crs = lambda a, b: a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+        clp = lambda t: torch.clamp(t, 0.0, 1.0)
+        pq0 = w0 - e0 * clp((w0 * e0).sum(-1) / d2(e0).clamp_min(1e-12)).unsqueeze(-1)
+        pq1 = w1 - e1 * clp((w1 * e1).sum(-1) / d2(e1).clamp_min(1e-12)).unsqueeze(-1)
+        pq2 = w2 - e2 * clp((w2 * e2).sum(-1) / d2(e2).clamp_min(1e-12)).unsqueeze(-1)
+        s = torch.sign(e0[0] * e2[1] - e0[1] * e2[0])
+        dx = torch.minimum(torch.minimum(d2(pq0), d2(pq1)), d2(pq2))
+        dy = torch.minimum(torch.minimum(s * crs(w0, e0), s * crs(w1, e1)), s * crs(w2, e2))
+        return -torch.sqrt(dx.clamp_min(1e-12)) * torch.sign(dy)
+
+    def _sdf_prism(self, p, tri, zlo, zhi):
+        """Signed distance to a vertical triangular prism (triangle in x-y, extruded in z)."""
+        v = [torch.tensor(t, device=p.device, dtype=p.dtype) for t in tri]
+        d = self._sdf_tri2d(p[..., :2], v[0], v[1], v[2])
+        zc = 0.5 * (zlo + zhi); zh = 0.5 * (zhi - zlo)
+        dz = torch.abs(p[..., 2] - zc) - zh
+        out = torch.norm(torch.stack([torch.clamp(d, min=0.0), torch.clamp(dz, min=0.0)], dim=-1), dim=-1)
+        return out + torch.clamp(torch.maximum(d, dz), max=0.0)
+
+    def gate_obstacle_sdf(self, p):
+        """Signed distance from position p (...,3) to the gate obstacle set.
+        Obstacle = (gate frame panel MINUS the two holes)  UNION  (two triangular stands).
+        >0 outside the solid, <0 inside it."""
+        T = lambda a: torch.tensor(a, device=p.device, dtype=p.dtype)
+        # frame panel with the two openings carved out:  solid AND NOT(holes)
+        sd_solid = self._sdf_box(p, T(self.frame_lo), T(self.frame_hi))
+        sd_holes = torch.minimum(self._sdf_box(p, T(self.hole_up_lo), T(self.hole_up_hi)),
+                                 self._sdf_box(p, T(self.hole_lo_lo), T(self.hole_lo_hi)))
+        sd_frame = torch.maximum(sd_solid, -sd_holes)
+        # two triangular stands
+        sd_L = self._sdf_prism(p, self.standL_tri, self.stand_z[0], self.stand_z[1])
+        sd_R = self._sdf_prism(p, self.standR_tri, self.stand_z[0], self.stand_z[1])
+        # union of all obstacle pieces
+        return torch.minimum(torch.minimum(sd_frame, sd_L), sd_R)
+
+    def avoid_fn(self, state):
+        # min signed distance to the gate obstacle, inflated by the drone radius
+        return self.gate_obstacle_sdf(state[..., 0:3]) - self.collisionR
+
+    def boundary_fn(self, state):
+        # avoid BRT: l(x) > 0 = safe (outside obstacle), l(x) < 0 = collision (failure set)
+        return self.avoid_fn(state)
+
+    def sample_target_state(self, num_samples):
+        # sample states whose position lies in the gate's bounding region (failure-set
+        # neighbourhood), with random orientation/velocity; quaternion normalized.
+        rng = self.state_test_range()
+        rng[0] = [-1.10, -0.30]   # x near the panel
+        rng[1] = [-1.40, 1.40]    # y across both stands
+        rng[2] = [-1.85, 0.10]    # z over the gate height (z-DOWN)
+        rng = torch.tensor(rng)
+        s = rng[:, 0] + torch.rand(num_samples, self.state_dim) * (rng[:, 1] - rng[:, 0])
+        return self.normalize_q(s)
+    
+    def cost_fn(self, state_traj):
+        if self.set_mode=='avoid':
+            return torch.min(self.boundary_fn(state_traj), dim=-1).values
+        else:
+            # return min_t max{l(x(t)), max_k_up_to_t{-g(x(k))}}, where l(x) is reach_fn, g(x) is avoid_fn
+            reach_values = self.reach_fn(state_traj)
+            avoid_values = self.avoid_fn(state_traj)
+            return torch.min(torch.clamp(reach_values, min=torch.max(-avoid_values, dim=-1).values.unsqueeze(-1)),dim=-1).values
+
+    def hamiltonian(self, state, dvds):
+        if self.set_mode == 'avoid':
+            qw = state[..., 3] * 1.0
+            qx = state[..., 4] * 1.0
+            qy = state[..., 5] * 1.0
+            qz = state[..., 6] * 1.0
+            vx = state[..., 7] * 1.0
+            vy = state[..., 8] * 1.0
+            vz = state[..., 9] * 1.0
+
+            # Compute the hamiltonian for the quadrotor
+            ham = dvds[..., 0] * vx + dvds[..., 1] * vy + dvds[..., 2] * vz
+
+            ham += torch.abs(-dvds[..., 3] * qx / 2.0 + dvds[..., 4] * qw / 2.0 + dvds[..., 5] * qz / 2.0 + -dvds[..., 6] * qy / 2.0) * self.w_max_xy # wx terms
+            ham += torch.abs(-dvds[..., 3] * qy / 2.0 + -dvds[..., 4] * qz / 2.0 + dvds[..., 5] * qw / 2.0 + dvds[..., 6] * qx / 2.0) * self.w_max_xy  # wy terms
+            ham += torch.abs(-dvds[..., 3] * qz / 2.0 + dvds[..., 4] * qy / 2.0 + -dvds[..., 5] * qx / 2.0 + dvds[..., 6] * qw / 2.0) * self.w_max_z # wz terms
+
+            c1 = 2 * (qw * qy + qx * qz) / self.m
+            c2 = 2 * (-qw * qx + qy * qz) / self.m
+            c3 = (1 - 2 * torch.pow(qx, 2) - 2 * torch.pow(qy, 2)) / self.m
+            
+            # Calculate the expression once to avoid repeating it
+            expr = dvds[..., 7] * c1 + dvds[..., 8] * c2 + dvds[..., 9] * c3
+            
+            # Use torch.where for batched conditional operations
+            ham += torch.where(
+                torch.sign(expr) > 0,  # condition: sign is positive (1)
+                expr * self.f_max,     # value if condition is true
+                expr * self.f_min      # value if condition is false
+            )
+
+            ham += dvds[..., 9] * self.Gz
+
+        return ham
+
+    def optimal_control(self, state, dvds):
+        if self.set_mode == 'avoid':
+            qw = state[..., 3] * 1.0
+            qx = state[..., 4] * 1.0
+            qy = state[..., 5] * 1.0
+            qz = state[..., 6] * 1.0
+
+            c1 = 2 * (qw * qy + qx * qz) / self.m
+            c2 = 2 * (-qw * qx + qy * qz) / self.m
+            c3 = (1 - 2 * torch.pow(qx, 2) - 2 * torch.pow(qy, 2)) / self.m
+
+            # Calculate the expression once to avoid repeating it
+            expr = dvds[..., 7] * c1 + dvds[..., 8] * c2 + dvds[..., 9] * c3
+
+            # Use torch.where for batched conditional operations
+            u1 = torch.where(
+                torch.sign(expr) > 0,  # condition: sign is positive (1)
+                self.f_max,           # value if condition is true
+                self.f_min            # value if condition is false
+            )
+
+            u2 = torch.sign(-dvds[..., 3] * qx / 2.0 + dvds[..., 4] * qw / 2.0 + dvds[..., 5] * qz / 2.0 + -dvds[..., 6] * qy / 2.0) * self.w_max_xy
+            u3 = torch.sign(-dvds[..., 3] * qy / 2.0 + -dvds[..., 4] * qz / 2.0 + dvds[..., 5] * qw / 2.0 + dvds[..., 6] * qx / 2.0) * self.w_max_xy
+            u4 = torch.sign(-dvds[..., 3] * qz / 2.0 + dvds[..., 4] * qy / 2.0 + -dvds[..., 5] * qx / 2.0 + dvds[..., 6] * qw / 2.0) * self.w_max_z
+
+        return torch.cat((u1[..., None], u2[..., None], u3[..., None], u4[..., None]), dim=-1)
+
+    def optimal_disturbance(self, state, dvds):
+        return torch.zeros(1)
+
+
+    def plot_config(self):
+        # default 2D slice: top-down (x,y) plane at the LOWER hole height, level hover,
+        # zero velocity. (z-DOWN: lower-hole centre z ~= -0.47)
+        return {
+            'state_slices': [-0.73, 0.0, -0.47, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            'state_labels': ['x', 'y', 'z', 'qw', 'qx', 'qy', 'qz', 'vx', 'vy', 'vz'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
+        }
