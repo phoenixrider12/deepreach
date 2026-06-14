@@ -1269,7 +1269,7 @@ class LessLinearND(Dynamics):
 
    
 class Quadrotor10D(Dynamics):
-    def __init__(self, stand_shape: str = 'prism'):
+    def __init__(self, stand_shape: str = 'prism', top_shape: str = 'bar'):
         # stand_shape: how the two side stands enter the obstacle set.
         #   'prism'  -> exact triangular vertical prisms (default; original geometry).
         #   'cuboid' -> each stand approximated by the axis-aligned bounding box of its
@@ -1277,8 +1277,17 @@ class Quadrotor10D(Dynamics):
         #               over the same z. A conservative over-approximation (cuboid contains
         #               the prism) that swaps the triangle SDF for a cheap box SDF -> a
         #               smoother, easier-to-learn boundary for BRT computation.
+        # top_shape: how the TOP of the gate enters the obstacle set.
+        #   'bar'  -> the measured top crossbar as a thin box (default; original geometry).
+        #   'roof' -> a horizontal half-space at the top bar's lower face: everything at or
+        #             above it (z <= roof_z, z-DOWN) is obstacle, so the drone must stay
+        #             BELOW it. Replaces a thin slab with a linear SDF -> much easier to
+        #             learn; conservative (blocks all airspace over the gate, not just the
+        #             gap), so the drone can only pass THROUGH the holes, not over the top.
         assert stand_shape in ('prism', 'cuboid'), f"bad stand_shape: {stand_shape}"
+        assert top_shape in ('bar', 'roof'), f"bad top_shape: {top_shape}"
         self.stand_shape = stand_shape
+        self.top_shape = top_shape
         # ===== drone 'carl' (SousVide configs/frames/carl.json) =====
         # This model is IDENTICAL to SousVide's figs/dynamics/quadcopter_rate_model
         # (quaternion kinematics + collective thrust along body-z + gravity), in the
@@ -1317,10 +1326,18 @@ class Quadrotor10D(Dynamics):
         # stands themselves, and the bottom is open.
         # Inter-stand gap (= hole y-extent) and panel depth (x):
         gap_y = [-0.37, 0.50]; panel_x = [-1.034, -0.430]
-        # Two thin horizontal bars (boxes) spanning the gap between the stands.
-        # Measured thicknesses: top ~0.04 m (z[-1.86,-1.82]), middle ~0.06 m (z[-0.98,-0.92]).
-        self.bar_top_lo = [panel_x[0], gap_y[0], -1.86]; self.bar_top_hi = [panel_x[1], gap_y[1], -1.82]
-        self.bar_mid_lo = [panel_x[0], gap_y[0], -0.98]; self.bar_mid_hi = [panel_x[1], gap_y[1], -0.92]
+        # Two horizontal bars (boxes) spanning the gap between the stands.
+        # Measured thicknesses are thin (top ~0.04 m, middle ~0.06 m) but sub-resolution
+        # for the value network, so both are inflated to 0.10 m about their measured
+        # z-centres (top -1.84 -> z[-1.89,-1.79], middle -0.95 -> z[-1.00,-0.90]). This
+        # is a conservative over-approximation (obstacle grows) -> inner-safe BRT, easier
+        # to learn.
+        self.bar_top_lo = [panel_x[0], gap_y[0], -1.89]; self.bar_top_hi = [panel_x[1], gap_y[1], -1.79]
+        self.bar_mid_lo = [panel_x[0], gap_y[0], -1.00]; self.bar_mid_hi = [panel_x[1], gap_y[1], -0.90]
+        # Roof level (used when top_shape == 'roof'): the top bar's lower face. Drone must
+        # stay below it -> safe half-space is z > roof_z (z-DOWN), so the upper hole between
+        # roof and middle bar stays open.
+        self.roof_z = self.bar_top_hi[2]   # -1.79
         # Two triangular stands (vertical prisms): (x,y) vertices + z extent.
         # Triangle base = inner edge at the hole side; apex points outward in y.
         self.stand_z = [-1.85, 0.10]
@@ -1340,10 +1357,21 @@ class Quadrotor10D(Dynamics):
         self.floor_z = 0.10
 
         # ===== state-space box enclosing the gate (BRT compute domain) =====
+        # z-range (z-DOWN). With top_shape='roof' everything above the roof is deep in the
+        # failure set, so we don't waste samples up there: shrink to just the flyable
+        # corridor (roof..floor) plus a small margin on each side to anchor l<0 at the two
+        # boundaries. With top_shape='bar' the airspace above the gate is open/flyable, so
+        # keep the original full range.
+        z_margin = 0.20
+        if self.top_shape == 'roof':
+            z_lo = self.roof_z - z_margin          # -1.99: thin obstacle band above roof
+            z_hi = self.floor_z + z_margin         #  0.30: thin obstacle band below floor
+        else:
+            z_lo, z_hi = -2.5, 0.5                 # original full range (airspace open above)
         self.state_range_ = torch.tensor([
             [-3.0, 2.0],     # x  (gate panel at x~-0.73)
             [-2.5, 2.5],     # y  (stands reach +/-1.4)
-            [-2.5, 0.5],     # z  (z-DOWN: -2.5 above gate top, +0.5 below floor)
+            [z_lo, z_hi],    # z  (z-DOWN; shrunk to the corridor when top_shape='roof')
             [-1.0, 1.0],     # qw
             [-1.0, 1.0],     # qx
             [-1.0, 1.0],     # qy
@@ -1473,12 +1501,16 @@ class Quadrotor10D(Dynamics):
 
     def gate_obstacle_sdf(self, p):
         """Signed distance from position p (...,3) to the obstacle set.
-        Obstacle = two triangular-prism stands  UNION  top bar  UNION  middle bar
+        Obstacle = two stands  UNION  top (bar or roof half-space)  UNION  middle bar
                    UNION  the floor half-space (z >= floor_z).
-        The two big holes (upper between the bars, lower below the middle bar) are
-        the obstacle-free space between these pieces. >0 outside, <0 inside."""
+        With top_shape='roof' the top piece is the half-space z <= roof_z (everything
+        above the gate), confining the drone below it; the upper hole (roof..middle bar)
+        and lower hole (middle bar..floor) remain open. >0 outside, <0 inside."""
         T = lambda a: torch.tensor(a, device=p.device, dtype=p.dtype)
-        sd_top = self._sdf_box(p, T(self.bar_top_lo), T(self.bar_top_hi))   # top bar
+        if self.top_shape == 'roof':
+            sd_top = p[..., 2] - self.roof_z   # >0 below roof (safe), <0 at/above it (z-DOWN)
+        else:
+            sd_top = self._sdf_box(p, T(self.bar_top_lo), T(self.bar_top_hi))   # top bar (box)
         sd_mid = self._sdf_box(p, T(self.bar_mid_lo), T(self.bar_mid_hi))   # middle bar
         if self.stand_shape == 'cuboid':
             sd_L = self._sdf_box(p, T(self.standL_box_lo), T(self.standL_box_hi))  # -y stand (box)
@@ -1587,15 +1619,21 @@ class Quadrotor10D(Dynamics):
 
     def plot_config(self):
         # top-down (x,y) slices, level hover, zero velocity. The wandb validation
-        # sweep renders one column per z in 'z_values' (z-DOWN, so listed physically
-        # top->bottom): above the whole gate, the top crossbar, the open hole between
-        # the bars, and the middle crossbar.
+        # sweep renders one column per z in 'z_values' (z-DOWN, listed physically
+        # top->bottom).
+        if self.top_shape == 'roof':
+            # above the roof is all-solid -> a slice there shows nothing. Keep only
+            # below-roof heights (z > roof_z, z-DOWN): just-below-roof / upper hole /
+            # middle bar / lower hole near floor.
+            z_values = [z for z in [-1.75, -1.40, -0.95, -0.30] if z > self.roof_z]
+        else:
+            # above gate / top bar / open hole / middle bar
+            z_values = [-2.20, -1.84, -1.40, -0.95]
         return {
             'state_slices': [-0.73, 0.0, -0.95, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             'state_labels': ['x', 'y', 'z', 'qw', 'qx', 'qy', 'qz', 'vx', 'vy', 'vz'],
             'x_axis_idx': 0,
             'y_axis_idx': 1,
             'z_axis_idx': 2,
-            # explicit z-slices (m, z-DOWN): above gate / top bar / open hole / middle bar
-            'z_values': [-2.20, -1.84, -1.40, -0.95],
+            'z_values': z_values,
         }
