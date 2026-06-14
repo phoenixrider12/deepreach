@@ -1298,17 +1298,28 @@ class Quadrotor10D(Dynamics):
         self.collisionR = 0.20
 
         # ===== mid_gate "gate" obstacle (SousVide world frame, z-DOWN, metres) =====
-        # Measured from the mid_gate GSplat. All in the same frame the drone flies in.
-        # Gate frame panel (solid box; the two holes are carved out of it):
-        self.frame_lo = [-1.034, -0.50, -1.85]   # [x,y,z] min  (z=-1.85 top, +0.02 bottom)
-        self.frame_hi = [-0.430,  0.65,  0.02]   # [x,y,z] max
-        # Two traversable openings (x widened so the holes fully pierce the panel):
-        self.hole_up_lo = [-1.30, -0.37, -1.82]; self.hole_up_hi = [-0.20, 0.50, -0.97]  # upper
-        self.hole_lo_lo = [-1.30, -0.37, -0.92]; self.hole_lo_hi = [-0.20, 0.50, -0.03]  # lower
-        # Two triangular stands (vertical prisms): (x,y) triangle vertices + z extent.
+        # Measured from the mid_gate GSplat (same frame the drone flies in). The gate is:
+        #   * two SEPARATE triangular-prism stands (left -y, right +y), NOT touching;
+        #   * between them, only TWO thin horizontal bars (one at the top, one in the
+        #     middle) bridging the inner stand edges. Everything else in the gap is open,
+        #     giving TWO big traversable holes: an UPPER hole (between top & middle bars)
+        #     and a LOWER hole (below the middle bar, open down to the floor).
+        # There are NO vertical posts and NO bottom bar: the holes' side-walls are the
+        # stands themselves, and the bottom is open.
+        # Inter-stand gap (= hole y-extent) and panel depth (x):
+        gap_y = [-0.37, 0.50]; panel_x = [-1.034, -0.430]
+        # Two thin horizontal bars (boxes) spanning the gap between the stands.
+        # Measured thicknesses: top ~0.04 m (z[-1.86,-1.82]), middle ~0.06 m (z[-0.98,-0.92]).
+        self.bar_top_lo = [panel_x[0], gap_y[0], -1.86]; self.bar_top_hi = [panel_x[1], gap_y[1], -1.82]
+        self.bar_mid_lo = [panel_x[0], gap_y[0], -0.98]; self.bar_mid_hi = [panel_x[1], gap_y[1], -0.92]
+        # Two triangular stands (vertical prisms): (x,y) vertices + z extent.
+        # Triangle base = inner edge at the hole side; apex points outward in y.
         self.stand_z = [-1.85, 0.10]
-        self.standL_tri = [[-1.034, -0.50], [-0.430, -0.50], [-0.732, -1.40]]  # -y side
-        self.standR_tri = [[-1.034,  0.65], [-0.430,  0.65], [-0.732,  1.40]]  # +y side
+        self.standL_tri = [[panel_x[0], gap_y[0]], [panel_x[1], gap_y[0]], [-0.732, -1.30]]  # -y side
+        self.standR_tri = [[panel_x[0], gap_y[1]], [panel_x[1], gap_y[1]], [-0.732,  1.30]]  # +y side
+        # Floor (ground) as an obstacle half-space: z-DOWN, so everything at or below
+        # z = floor_z (the stand base / ground level) is obstacle. The drone must stay above it.
+        self.floor_z = 0.10
 
         # ===== state-space box enclosing the gate (BRT compute domain) =====
         self.state_range_ = torch.tensor([
@@ -1443,20 +1454,20 @@ class Quadrotor10D(Dynamics):
         return out + torch.clamp(torch.maximum(d, dz), max=0.0)
 
     def gate_obstacle_sdf(self, p):
-        """Signed distance from position p (...,3) to the gate obstacle set.
-        Obstacle = (gate frame panel MINUS the two holes)  UNION  (two triangular stands).
-        >0 outside the solid, <0 inside it."""
+        """Signed distance from position p (...,3) to the obstacle set.
+        Obstacle = two triangular-prism stands  UNION  top bar  UNION  middle bar
+                   UNION  the floor half-space (z >= floor_z).
+        The two big holes (upper between the bars, lower below the middle bar) are
+        the obstacle-free space between these pieces. >0 outside, <0 inside."""
         T = lambda a: torch.tensor(a, device=p.device, dtype=p.dtype)
-        # frame panel with the two openings carved out:  solid AND NOT(holes)
-        sd_solid = self._sdf_box(p, T(self.frame_lo), T(self.frame_hi))
-        sd_holes = torch.minimum(self._sdf_box(p, T(self.hole_up_lo), T(self.hole_up_hi)),
-                                 self._sdf_box(p, T(self.hole_lo_lo), T(self.hole_lo_hi)))
-        sd_frame = torch.maximum(sd_solid, -sd_holes)
-        # two triangular stands
-        sd_L = self._sdf_prism(p, self.standL_tri, self.stand_z[0], self.stand_z[1])
-        sd_R = self._sdf_prism(p, self.standR_tri, self.stand_z[0], self.stand_z[1])
-        # union of all obstacle pieces
-        return torch.minimum(torch.minimum(sd_frame, sd_L), sd_R)
+        sd_top = self._sdf_box(p, T(self.bar_top_lo), T(self.bar_top_hi))   # top bar
+        sd_mid = self._sdf_box(p, T(self.bar_mid_lo), T(self.bar_mid_hi))   # middle bar
+        sd_L = self._sdf_prism(p, self.standL_tri, self.stand_z[0], self.stand_z[1])  # -y stand
+        sd_R = self._sdf_prism(p, self.standR_tri, self.stand_z[0], self.stand_z[1])  # +y stand
+        sd_floor = self.floor_z - p[..., 2]    # >0 above floor (z<floor_z), <0 below it (z-DOWN)
+        # union of all obstacle pieces (closest surface wins)
+        sd_struct = torch.minimum(torch.minimum(sd_top, sd_mid), torch.minimum(sd_L, sd_R))
+        return torch.minimum(sd_struct, sd_floor)
 
     def avoid_fn(self, state):
         # min signed distance to the gate obstacle, inflated by the drone radius
