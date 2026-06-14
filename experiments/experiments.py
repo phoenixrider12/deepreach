@@ -959,7 +959,11 @@ class Experiment(ABC):
 
         xs = torch.linspace(x_min, x_max, x_resolution)
         ys = torch.linspace(y_min, y_max, y_resolution)
-        zs = torch.linspace(z_min, z_max, z_resolution)
+        # honor explicit z-slices from plot_config (e.g. crossbar heights); else sweep evenly
+        if plot_config.get('z_values') is not None:
+            zs = torch.tensor(plot_config['z_values'], dtype=xs.dtype)
+        else:
+            zs = torch.linspace(z_min, z_max, z_resolution)
         xys = torch.cartesian_prod(xs, ys)
 
         fig = plt.figure(figsize=(6*len(zs),5*len(times)))

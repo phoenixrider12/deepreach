@@ -1269,7 +1269,16 @@ class LessLinearND(Dynamics):
 
    
 class Quadrotor10D(Dynamics):
-    def __init__(self):
+    def __init__(self, stand_shape: str = 'prism'):
+        # stand_shape: how the two side stands enter the obstacle set.
+        #   'prism'  -> exact triangular vertical prisms (default; original geometry).
+        #   'cuboid' -> each stand approximated by the axis-aligned bounding box of its
+        #               triangle (base width in x  x  base->apex height in y), extruded
+        #               over the same z. A conservative over-approximation (cuboid contains
+        #               the prism) that swaps the triangle SDF for a cheap box SDF -> a
+        #               smoother, easier-to-learn boundary for BRT computation.
+        assert stand_shape in ('prism', 'cuboid'), f"bad stand_shape: {stand_shape}"
+        self.stand_shape = stand_shape
         # ===== drone 'carl' (SousVide configs/frames/carl.json) =====
         # This model is IDENTICAL to SousVide's figs/dynamics/quadcopter_rate_model
         # (quaternion kinematics + collective thrust along body-z + gravity), in the
@@ -1317,6 +1326,15 @@ class Quadrotor10D(Dynamics):
         self.stand_z = [-1.85, 0.10]
         self.standL_tri = [[panel_x[0], gap_y[0]], [panel_x[1], gap_y[0]], [-0.732, -1.30]]  # -y side
         self.standR_tri = [[panel_x[0], gap_y[1]], [panel_x[1], gap_y[1]], [-0.732,  1.30]]  # +y side
+        # Cuboid approximation of each stand: the (x,y) bounding box of the triangle
+        # (x = base width ~0.60 m, y = base->apex height: L ~0.93 m, R ~0.80 m) extruded
+        # over stand_z. Conservative (box >= prism); used when stand_shape == 'cuboid'.
+        def _tri_box(tri):
+            xs = [v[0] for v in tri]; ys = [v[1] for v in tri]
+            return ([min(xs), min(ys), self.stand_z[0]],
+                    [max(xs), max(ys), self.stand_z[1]])
+        self.standL_box_lo, self.standL_box_hi = _tri_box(self.standL_tri)
+        self.standR_box_lo, self.standR_box_hi = _tri_box(self.standR_tri)
         # Floor (ground) as an obstacle half-space: z-DOWN, so everything at or below
         # z = floor_z (the stand base / ground level) is obstacle. The drone must stay above it.
         self.floor_z = 0.10
@@ -1462,8 +1480,12 @@ class Quadrotor10D(Dynamics):
         T = lambda a: torch.tensor(a, device=p.device, dtype=p.dtype)
         sd_top = self._sdf_box(p, T(self.bar_top_lo), T(self.bar_top_hi))   # top bar
         sd_mid = self._sdf_box(p, T(self.bar_mid_lo), T(self.bar_mid_hi))   # middle bar
-        sd_L = self._sdf_prism(p, self.standL_tri, self.stand_z[0], self.stand_z[1])  # -y stand
-        sd_R = self._sdf_prism(p, self.standR_tri, self.stand_z[0], self.stand_z[1])  # +y stand
+        if self.stand_shape == 'cuboid':
+            sd_L = self._sdf_box(p, T(self.standL_box_lo), T(self.standL_box_hi))  # -y stand (box)
+            sd_R = self._sdf_box(p, T(self.standR_box_lo), T(self.standR_box_hi))  # +y stand (box)
+        else:
+            sd_L = self._sdf_prism(p, self.standL_tri, self.stand_z[0], self.stand_z[1])  # -y stand
+            sd_R = self._sdf_prism(p, self.standR_tri, self.stand_z[0], self.stand_z[1])  # +y stand
         sd_floor = self.floor_z - p[..., 2]    # >0 above floor (z<floor_z), <0 below it (z-DOWN)
         # union of all obstacle pieces (closest surface wins)
         sd_struct = torch.minimum(torch.minimum(sd_top, sd_mid), torch.minimum(sd_L, sd_R))
@@ -1564,12 +1586,16 @@ class Quadrotor10D(Dynamics):
 
 
     def plot_config(self):
-        # default 2D slice: top-down (x,y) plane at the LOWER hole height, level hover,
-        # zero velocity. (z-DOWN: lower-hole centre z ~= -0.47)
+        # top-down (x,y) slices, level hover, zero velocity. The wandb validation
+        # sweep renders one column per z in 'z_values' (z-DOWN, so listed physically
+        # top->bottom): above the whole gate, the top crossbar, the open hole between
+        # the bars, and the middle crossbar.
         return {
-            'state_slices': [-0.73, 0.0, -0.47, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            'state_slices': [-0.73, 0.0, -0.95, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             'state_labels': ['x', 'y', 'z', 'qw', 'qx', 'qy', 'qz', 'vx', 'vy', 'vz'],
             'x_axis_idx': 0,
             'y_axis_idx': 1,
             'z_axis_idx': 2,
+            # explicit z-slices (m, z-DOWN): above gate / top bar / open hole / middle bar
+            'z_values': [-2.20, -1.84, -1.40, -0.95],
         }
