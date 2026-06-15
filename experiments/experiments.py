@@ -1050,6 +1050,16 @@ class Experiment(ABC):
                 'step': epoch,
                 'val_plot': wandb.Image(fig),
             })
+            # extra validation plots with a non-spatial swept axis (e.g. velocity), if the
+            # dynamics defines them. Each cfg is a plot_config dict with its own z_axis_idx,
+            # z_values and a 'name' for the wandb key.
+            extra = getattr(self.dataset.dynamics, 'extra_plot_configs', None)
+            if extra is not None:
+                for cfg in extra():
+                    fig_e = self.plotMultipleFigs(
+                        state_test_range, cfg, x_resolution, y_resolution, z_resolution, times)
+                    wandb.log({'step': epoch, cfg.get('name', 'val_plot_extra'): wandb.Image(fig_e)})
+                    plt.close(fig_e)
         plt.close()
         plt.close()
         if was_training:

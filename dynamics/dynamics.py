@@ -1637,3 +1637,17 @@ class Quadrotor10D(Dynamics):
             'z_axis_idx': 2,
             'z_values': z_values,
         }
+
+    def extra_plot_configs(self):
+        # Additional wandb validation plots whose swept (3rd) axis is NOT a spatial
+        # coordinate. Here: the x-y safe set swept over forward velocity vx (state idx 7)
+        # at the middle-bar height. boundary_fn ignores velocity, so the failure-set
+        # contour is identical across columns while the learned BRT grows with |vx| --
+        # this visualizes how forward speed enlarges the doomed region upstream of the gate.
+        base = self.plot_config()
+        return [{
+            **base,
+            'name': 'val_plot_vx',
+            'z_axis_idx': 7,                       # vx
+            'z_values': [-4.0, 0.0, 2.0, 4.0],     # m/s, within the [-6,6] vx domain
+        }]
