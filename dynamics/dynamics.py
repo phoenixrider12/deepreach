@@ -1617,37 +1617,30 @@ class Quadrotor10D(Dynamics):
         return torch.zeros(1)
 
 
-    def plot_config(self):
-        # top-down (x,y) slices, level hover, zero velocity. The wandb validation
-        # sweep renders one column per z in 'z_values' (z-DOWN, listed physically
-        # top->bottom).
-        if self.top_shape == 'roof':
-            # above the roof is all-solid -> a slice there shows nothing. Keep only
-            # below-roof heights (z > roof_z, z-DOWN): just-below-roof / upper hole /
-            # middle bar / lower hole near floor.
-            z_values = [z for z in [-1.75, -1.40, -0.95, -0.30] if z > self.roof_z]
-        else:
-            # above gate / top bar / open hole / middle bar
-            z_values = [-2.20, -1.84, -1.40, -0.95]
+    def _velocity_plot_config(self, vel_idx, name):
+        # x-y safe-set slices swept over one velocity component (vel_idx: 7=vx, 8=vy,
+        # 9=vz) at the middle-bar height, level hover. boundary_fn ignores velocity, so
+        # the failure-set contour is identical across columns while the learned BRT grows
+        # with speed -- visualizing how momentum enlarges the doomed region near the gate.
         return {
             'state_slices': [-0.73, 0.0, -0.95, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             'state_labels': ['x', 'y', 'z', 'qw', 'qx', 'qy', 'qz', 'vx', 'vy', 'vz'],
             'x_axis_idx': 0,
             'y_axis_idx': 1,
-            'z_axis_idx': 2,
-            'z_values': z_values,
+            'z_axis_idx': vel_idx,
+            'z_values': [-4.0, -2.0, 0.0, 2.0, 4.0],     # m/s, within the [-6,6] velocity domain
+            'name': name,
         }
 
+    def plot_config(self):
+        # main wandb validation plot: x-y safe set swept over forward velocity vx (idx 7).
+        return self._velocity_plot_config(7, 'val_plot_vx')
+
     def extra_plot_configs(self):
-        # Additional wandb validation plots whose swept (3rd) axis is NOT a spatial
-        # coordinate. Here: the x-y safe set swept over forward velocity vx (state idx 7)
-        # at the middle-bar height. boundary_fn ignores velocity, so the failure-set
-        # contour is identical across columns while the learned BRT grows with |vx| --
-        # this visualizes how forward speed enlarges the doomed region upstream of the gate.
-        base = self.plot_config()
-        return [{
-            **base,
-            'name': 'val_plot_vx',
-            'z_axis_idx': 7,                       # vx
-            'z_values': [-4.0, 0.0, 2.0, 4.0],     # m/s, within the [-6,6] vx domain
-        }]
+        # extra wandb plots rendered by validate(): lateral velocity vy (idx 8) sweep,
+        # plus the vertical velocity vz sweep delegated to vz_plot_config().
+        return [self._velocity_plot_config(8, 'val_plot_vy'), self.vz_plot_config()]
+
+    def vz_plot_config(self):
+        # x-y safe set swept over vertical velocity vz (idx 9).
+        return self._velocity_plot_config(9, 'val_plot_vz')
