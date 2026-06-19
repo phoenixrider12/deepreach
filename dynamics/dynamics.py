@@ -1269,7 +1269,15 @@ class LessLinearND(Dynamics):
 
    
 class Quadrotor10D(Dynamics):
-    def __init__(self, stand_shape: str = 'prism', top_shape: str = 'bar'):
+    def __init__(self, env: str = 'gate', stand_shape: str = 'prism', top_shape: str = 'bar'):
+        # env: which obstacle SETTING to build the BRT for.
+        #   'gate'     -> mid_gate scene: two triangular stands + crossbars/roof + floor.
+        #   'backroom' -> backroom scene: perimeter walls + central divider + lower block
+        #                 + a triangular top-right corner + floor/ceiling (from the edited
+        #                 occupancy map; world frame, z-DOWN, metres, scale 1.0).
+        # stand_shape / top_shape only apply to env='gate' (ignored for 'backroom').
+        assert env in ('gate', 'backroom'), f"bad env: {env}"
+        self.env = env
         # stand_shape: how the two side stands enter the obstacle set.
         #   'prism'  -> exact triangular vertical prisms (default; original geometry).
         #   'cuboid' -> each stand approximated by the axis-aligned bounding box of its
@@ -1356,22 +1364,37 @@ class Quadrotor10D(Dynamics):
         # z = floor_z (the stand base / ground level) is obstacle. The drone must stay above it.
         self.floor_z = 0.10
 
-        # ===== state-space box enclosing the gate (BRT compute domain) =====
-        # z-range (z-DOWN). With top_shape='roof' everything above the roof is deep in the
-        # failure set, so we don't waste samples up there: shrink to just the flyable
-        # corridor (roof..floor) plus a small margin on each side to anchor l<0 at the two
-        # boundaries. With top_shape='bar' the airspace above the gate is open/flyable, so
-        # keep the original full range.
-        z_margin = 0.20
-        if self.top_shape == 'roof':
-            z_lo = self.roof_z - z_margin          # -1.99: thin obstacle band above roof
-            z_hi = self.floor_z + z_margin         #  0.30: thin obstacle band below floor
+        # ===== backroom obstacle set (world frame, z-DOWN, metres; from the edited map) =====
+        # Vertical structures spanning floor..ceiling, given as (x0,y0,x1,y1) boxes, plus a
+        # triangular fill for the rounded top-right corner, plus floor/ceiling half-spaces.
+        self.br_floor_z = 0.20        # drone stays above floor: free is z < floor_z
+        self.br_ceil_z = -3.60        # drone stays below ceiling: free is z > ceil_z (z-DOWN)
+        self.br_boxes = [             # (x0, y0, x1, y1) vertical prisms over [ceil_z, floor_z]
+            (-3.59, -10.34, -1.91,  0.62),   # left wall
+            ( 1.93, -10.34,  3.45,  2.54),   # right wall
+            (-3.59,   2.54,  3.45,  3.82),   # top wall
+            (-0.71,  -6.26,  0.65, -1.14),   # central divider
+            (-0.47, -10.34,  0.73, -7.78),   # lower block
+        ]
+        self.br_tri = [(-1.10, 2.54), (1.93, 2.54), (1.93, 0.85)]  # top-right corner fillet
+
+        # ===== state-space box (BRT compute domain), per env =====
+        if self.env == 'backroom':
+            xr, yr, zr = [-3.70, 3.55], [-10.55, 4.00], [self.br_ceil_z - 0.20, self.br_floor_z + 0.20]
         else:
-            z_lo, z_hi = -2.5, 0.5                 # original full range (airspace open above)
+            # gate. z-range (z-DOWN): with top_shape='roof' everything above the roof is deep
+            # in the failure set, so shrink to the flyable corridor (roof..floor) + a small
+            # margin to anchor l<0 at the two boundaries; with 'bar' keep the full range.
+            z_margin = 0.20
+            if self.top_shape == 'roof':
+                z_lo, z_hi = self.roof_z - z_margin, self.floor_z + z_margin
+            else:
+                z_lo, z_hi = -2.5, 0.5
+            xr, yr, zr = [-3.0, 2.0], [-2.5, 2.5], [z_lo, z_hi]
         self.state_range_ = torch.tensor([
-            [-3.0, 2.0],     # x  (gate panel at x~-0.73)
-            [-2.5, 2.5],     # y  (stands reach +/-1.4)
-            [z_lo, z_hi],    # z  (z-DOWN; shrunk to the corridor when top_shape='roof')
+            xr,              # x
+            yr,              # y
+            zr,              # z  (z-DOWN)
             [-1.0, 1.0],     # qw
             [-1.0, 1.0],     # qx
             [-1.0, 1.0],     # qy
@@ -1523,21 +1546,43 @@ class Quadrotor10D(Dynamics):
         sd_struct = torch.minimum(torch.minimum(sd_top, sd_mid), torch.minimum(sd_L, sd_R))
         return torch.minimum(sd_struct, sd_floor)
 
+    def backroom_obstacle_sdf(self, p):
+        """Signed distance to the backroom obstacle set: perimeter walls + central divider
+        + lower block (vertical boxes over [ceil_z, floor_z]) UNION the top-right corner
+        triangle UNION floor/ceiling half-spaces. >0 free (inside room), <0 in obstacle."""
+        T = lambda a: torch.tensor(a, device=p.device, dtype=p.dtype)
+        sd = None
+        for (x0, y0, x1, y1) in self.br_boxes:
+            s = self._sdf_box(p, T([x0, y0, self.br_ceil_z]), T([x1, y1, self.br_floor_z]))
+            sd = s if sd is None else torch.minimum(sd, s)
+        sd = torch.minimum(sd, self._sdf_prism(p, self.br_tri, self.br_ceil_z, self.br_floor_z))
+        sd_floor = self.br_floor_z - p[..., 2]   # >0 above floor (z<floor_z)
+        sd_ceil = p[..., 2] - self.br_ceil_z     # >0 below ceiling (z>ceil_z, z-DOWN)
+        return torch.minimum(sd, torch.minimum(sd_floor, sd_ceil))
+
+    def obstacle_sdf(self, p):
+        return self.backroom_obstacle_sdf(p) if self.env == 'backroom' else self.gate_obstacle_sdf(p)
+
     def avoid_fn(self, state):
-        # min signed distance to the gate obstacle, inflated by the drone radius
-        return self.gate_obstacle_sdf(state[..., 0:3]) - self.collisionR
+        # min signed distance to the obstacle set, inflated by the drone radius
+        return self.obstacle_sdf(state[..., 0:3]) - self.collisionR
 
     def boundary_fn(self, state):
         # avoid BRT: l(x) > 0 = safe (outside obstacle), l(x) < 0 = collision (failure set)
         return self.avoid_fn(state)
 
     def sample_target_state(self, num_samples):
-        # sample states whose position lies in the gate's bounding region (failure-set
+        # sample states whose position lies in the obstacle bounding region (failure-set
         # neighbourhood), with random orientation/velocity; quaternion normalized.
         rng = self.state_test_range()
-        rng[0] = [-1.10, -0.30]   # x near the panel
-        rng[1] = [-1.40, 1.40]    # y across both stands
-        rng[2] = [-1.85, 0.10]    # z over the gate height (z-DOWN)
+        if self.env == 'backroom':
+            rng[0] = [-3.70, 3.55]    # x across the room
+            rng[1] = [-10.55, 4.00]   # y across the room
+            rng[2] = [self.br_ceil_z, self.br_floor_z]   # z over the room height (z-DOWN)
+        else:
+            rng[0] = [-1.10, -0.30]   # x near the panel
+            rng[1] = [-1.40, 1.40]    # y across both stands
+            rng[2] = [-1.85, 0.10]    # z over the gate height (z-DOWN)
         rng = torch.tensor(rng)
         s = rng[:, 0] + torch.rand(num_samples, self.state_dim) * (rng[:, 1] - rng[:, 0])
         return self.normalize_q(s)
@@ -1618,12 +1663,15 @@ class Quadrotor10D(Dynamics):
 
 
     def _velocity_plot_config(self, vel_idx, name):
-        # x-y safe-set slices swept over one velocity component (vel_idx: 7=vx, 8=vy,
-        # 9=vz) at the middle-bar height, level hover. boundary_fn ignores velocity, so
+        # x-y safe-set slices swept over one velocity component (vel_idx: 7=vx, 8=vy, 9=vz)
+        # at a representative flight height, level hover. boundary_fn ignores velocity, so
         # the failure-set contour is identical across columns while the learned BRT grows
-        # with speed -- visualizing how momentum enlarges the doomed region near the gate.
+        # with speed -- visualizing how momentum enlarges the doomed region.
+        # fixed (non-swept) slice: a free point at flight height for the env.
+        slc = [0.0, -3.0, -1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] if self.env == 'backroom' \
+            else [-0.73, 0.0, -0.95, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         return {
-            'state_slices': [-0.73, 0.0, -0.95, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            'state_slices': slc,
             'state_labels': ['x', 'y', 'z', 'qw', 'qx', 'qy', 'qz', 'vx', 'vy', 'vz'],
             'x_axis_idx': 0,
             'y_axis_idx': 1,
