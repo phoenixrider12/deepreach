@@ -1,6 +1,10 @@
 # DeepReach_MPC
  Bridging Model Predictive Control and Deep  Learning for Scalable Reachability Analysis
 
+> **Quadrotor10D obstacle settings (mid_gate & backroom):** this fork adds a 10-D
+> quadrotor with two splat-derived obstacle environments. Select with `--env gate`
+> or `--env backroom`. See [QUADROTOR10D_OBSTACLES.md](QUADROTOR10D_OBSTACLES.md).
+
 Authors: [Zeyuan Feng](https://thezeyuanfeng.github.io/), Le Qiu, [Somil Bansal](http://people.eecs.berkeley.edu/~somil/index.html)
 
 Acknowledgement: This repo is built on [DeepReach](https://github.com/smlbansal/deepreach). Thanks all the maintainers for the supports! <br>
